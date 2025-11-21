@@ -65,8 +65,8 @@
       .dark .bg-note-blue,
       .dark .bg-note-green,
       .dark .bg-note-red {
-        /* Adjust colors to be slightly muted in dark mode */
-        filter: brightness(0.85);
+        /* Keep card colors without dimming text content in dark mode */
+        filter: none;
       }
 
       /* Responsive grid columns */
@@ -825,6 +825,64 @@
       let searchTerm = "";
       let darkMode = false; // Global state for dark mode
       let useLocalStorage = false;
+      let editorReadOnly = false;
+
+      let idbDb = null;
+      let notesBC = null;
+      const idbOpen = () =>
+        new Promise((resolve, reject) => {
+          const req = indexedDB.open(`notes_${appId}`, 1);
+          req.onupgradeneeded = () => {
+            const db = req.result;
+            if (!db.objectStoreNames.contains("notes")) db.createObjectStore("notes", { keyPath: "id" });
+          };
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+      const idbEnsure = async () => {
+        if (!idbDb) idbDb = await idbOpen();
+        return idbDb;
+      };
+      const idbGetAllNotes = async () => {
+        const db = await idbEnsure();
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction("notes", "readonly");
+          const store = tx.objectStore("notes");
+          const req = store.getAll();
+          req.onsuccess = () => resolve(req.result || []);
+          req.onerror = () => reject(req.error);
+        });
+      };
+      const idbPutNote = async (note) => {
+        const db = await idbEnsure();
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction("notes", "readwrite");
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+          tx.objectStore("notes").put(note);
+        });
+      };
+      const idbDeleteNote = async (id) => {
+        const db = await idbEnsure();
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction("notes", "readwrite");
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+          tx.objectStore("notes").delete(id);
+        });
+      };
+      const idbClearNotes = async () => {
+        const db = await idbEnsure();
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction("notes", "readwrite");
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+          tx.objectStore("notes").clear();
+        });
+      };
+      const announceNotesUpdate = () => {
+        if (notesBC) notesBC.postMessage("updated");
+      };
 
       // Note data structure
       let currentNote = {
@@ -963,17 +1021,30 @@
       const startNotesListener = () => {
         if (!userId) return;
         if (useLocalStorage) {
-          const raw = localStorage.getItem(`notes_${appId}_${userId}`);
-          allNotes = raw ? JSON.parse(raw) : [];
-          const loadingMsg = document.getElementById("loading-message");
-          if (loadingMsg) loadingMsg.classList.add("hidden");
-          renderCurrentView();
-          window.addEventListener("storage", (e) => {
-            if (e.key === `notes_${appId}_${userId}`) {
-              allNotes = e.newValue ? JSON.parse(e.newValue) : [];
-              renderCurrentView();
+          idbGetAllNotes().then(async (notes) => {
+            if (!notes || notes.length === 0) {
+              const key = `notes_${appId}_${userId}`;
+              const raw = localStorage.getItem(key);
+              const arr = raw ? JSON.parse(raw) : [];
+              for (const n of arr) await idbPutNote(n);
+              try { localStorage.removeItem(key); } catch {}
+              allNotes = arr;
+            } else {
+              allNotes = notes;
             }
+            const loadingMsg = document.getElementById("loading-message");
+            if (loadingMsg) loadingMsg.classList.add("hidden");
+            renderCurrentView();
           });
+          notesBC = new BroadcastChannel(`notes_${appId}_${userId}`);
+          notesBC.onmessage = (e) => {
+            if (e.data === "updated") {
+              idbGetAllNotes().then((notes) => {
+                allNotes = notes;
+                renderCurrentView();
+              });
+            }
+          };
           return;
         }
         const notesRef = getNotesCollectionRef(userId);
@@ -1023,7 +1094,8 @@
           } else {
             allNotes.push(data);
           }
-          localStorage.setItem(`notes_${appId}_${userId}`, JSON.stringify(allNotes));
+          await idbPutNote(data);
+          announceNotesUpdate();
           renderCurrentView();
           showToast("Note saved");
           return;
@@ -1059,7 +1131,8 @@
         if (!userId || !id) return;
         if (useLocalStorage) {
           allNotes = allNotes.filter((n) => n.id !== id);
-          localStorage.setItem(`notes_${appId}_${userId}`, JSON.stringify(allNotes));
+          await idbDeleteNote(id);
+          announceNotesUpdate();
           renderCurrentView();
           showToast("Note deleted");
           return;
@@ -1080,7 +1153,8 @@
         if (!userId) return;
         if (useLocalStorage) {
           allNotes = [];
-          localStorage.setItem(`notes_${appId}_${userId}`, JSON.stringify(allNotes));
+          await idbClearNotes();
+          announceNotesUpdate();
           renderCurrentView();
           showToast("All notes have been deleted", "success");
           const deleteMessage = document.getElementById("delete-all-message");
@@ -1126,7 +1200,8 @@
           const idx = allNotes.findIndex((n) => n.id === id);
           if (idx >= 0) {
             allNotes[idx].archived = true;
-            localStorage.setItem(`notes_${appId}_${userId}`, JSON.stringify(allNotes));
+            await idbPutNote(allNotes[idx]);
+            announceNotesUpdate();
             renderCurrentView();
             showToast("Note archived");
           }
@@ -1150,7 +1225,8 @@
           const idx = allNotes.findIndex((n) => n.id === id);
           if (idx >= 0) {
             allNotes[idx].archived = false;
-            localStorage.setItem(`notes_${appId}_${userId}`, JSON.stringify(allNotes));
+            await idbPutNote(allNotes[idx]);
+            announceNotesUpdate();
             renderCurrentView();
             showToast("Note unarchived");
           }
@@ -1425,29 +1501,42 @@
         editorContent.value = currentNote.content;
         editorTags.value = currentNote.tags.join(", ");
 
+        editorTitle.readOnly = editorReadOnly;
+        editorContent.readOnly = editorReadOnly;
+        editorTags.readOnly = editorReadOnly;
+
         // Apply color to editor modal card
         setColor(currentNote.color);
 
         // Initial resize for existing content
         setTimeout(() => autoResizeTextarea(editorContent), 0);
-        editorContent.oninput = () => { autoResizeTextarea(editorContent); currentNote.content = editorContent.value; saveDraft(); };
-        editorTitle.oninput = () => { currentNote.title = editorTitle.value; saveDraft(); };
-        editorTags.oninput = () => {
-          const raw = editorTags.value || "";
-          const tags = raw.split(/[,#\s]+/).map((t) => t.trim().toLowerCase()).filter((t) => t.length);
-          currentNote.tags = Array.from(new Set(tags));
-          saveDraft();
-        };
+        if (!editorReadOnly) {
+          editorContent.oninput = () => { autoResizeTextarea(editorContent); currentNote.content = editorContent.value; saveDraft(); };
+          editorTitle.oninput = () => { currentNote.title = editorTitle.value; saveDraft(); };
+          editorTags.oninput = () => {
+            const raw = editorTags.value || "";
+            const tags = raw.split(/[,#\s]+/).map((t) => t.trim().toLowerCase()).filter((t) => t.length);
+            currentNote.tags = Array.from(new Set(tags));
+            saveDraft();
+          };
+        }
 
         // Update button actions
-        document.getElementById("delete-btn").onclick = () => {
-          if (currentNote.id) deleteNote(currentNote.id);
-          closeEditor(false); // Close without saving/updating
-        };
-        document.getElementById("archive-btn").onclick = () => {
-          currentNote.archived = currentView === "archive" ? false : true; // Unarchive if in archive view, otherwise archive
-          closeEditor(true); // Save and close
-        };
+        const deleteBtn = document.getElementById("delete-btn");
+        const archiveBtn = document.getElementById("archive-btn");
+        if (editorReadOnly) {
+          deleteBtn.classList.add("opacity-50", "pointer-events-none");
+          archiveBtn.classList.add("opacity-50", "pointer-events-none");
+        } else {
+          deleteBtn.onclick = () => {
+            if (currentNote.id) deleteNote(currentNote.id);
+            closeEditor(false);
+          };
+          archiveBtn.onclick = () => {
+            currentNote.archived = currentView === "archive" ? false : true;
+            closeEditor(true);
+          };
+        }
 
         const pinBtn = document.getElementById("pin-btn");
         const setPinVisual = () => {
@@ -1466,7 +1555,6 @@
         setPinVisual();
 
         // Update archive button title/icon based on view
-        const archiveBtn = document.getElementById("archive-btn");
         if (currentView === "archive") {
           archiveBtn.title = "Unarchive Note";
           archiveBtn.innerHTML =
@@ -1484,7 +1572,7 @@
       window.closeEditor = (shouldSave) => {
         const modal = document.getElementById("note-editor-modal");
 
-        if (shouldSave) {
+        if (shouldSave && !editorReadOnly) {
           currentNote.title = document
             .getElementById("editor-title")
             .value.trim();
@@ -1506,7 +1594,13 @@
         document.getElementById("editor-title").value = "";
         document.getElementById("editor-content").value = "";
         const t = document.getElementById("editor-tags"); if (t) t.value = "";
+        editorReadOnly = false;
         modal.classList.add("hidden");
+      };
+
+      window.openPreview = (note = {}) => {
+        editorReadOnly = true;
+        openEditor(note);
       };
 
       // --- VIEW & SEARCH FILTERING ---
@@ -1635,8 +1729,18 @@
             const pinA = a.pinned ? 1 : 0;
             const pinB = b.pinned ? 1 : 0;
             if (pinA !== pinB) return pinB - pinA;
-            const timeA = a.timestamp?.toDate()?.getTime() || 0;
-            const timeB = b.timestamp?.toDate()?.getTime() || 0;
+            const timeA =
+              typeof a.timestamp === "number"
+                ? a.timestamp
+                : typeof a.timestamp?.toDate === "function"
+                ? a.timestamp.toDate().getTime()
+                : 0;
+            const timeB =
+              typeof b.timestamp === "number"
+                ? b.timestamp
+                : typeof b.timestamp?.toDate === "function"
+                ? b.timestamp.toDate().getTime()
+                : 0;
             return timeB - timeA;
           });
       };
@@ -1693,7 +1797,7 @@
 
           if (note.color === "white") {
             noteElement.classList.add(
-              darkMode ? "bg-dark-card/80" : "bg-white/90"
+              darkMode ? "bg-dark-card" : "bg-white"
             );
           } else {
             noteElement.classList.add(`bg-${note.color}`);
@@ -1717,8 +1821,8 @@
             currentView === "archive" ? `animateUnarchive` : `animateArchive`;
 
           const contentSection = safeSnippet
-            ? `<p class="text-base leading-relaxed text-gray-600 dark:text-gray-200">${safeSnippet}</p>`
-            : `<p class="text-sm text-gray-400 dark:text-gray-500 italic">No content yet. Tap to add details.</p>`;
+            ? `<p class="text-base leading-relaxed text-gray-600 dark:text-gray-200 break-all">${safeSnippet}</p>`
+            : `<p class="text-sm text-gray-400 dark:text-gray-500 italic break-all">No content yet. Tap to add details.</p>`;
           const tags = Array.isArray(note.tags) ? note.tags : [];
           const tagsHTML =
             tags.length
@@ -1734,16 +1838,21 @@
             <div class="flex items-start justify-between gap-4">
               <div>
                 <p class="text-xs uppercase tracking-[0.35em] text-gray-400">${timestampLabel}</p>
-                <h3 class="text-2xl font-bold text-gray-900 dark:text-white mt-2 break-words">${safeTitle}</h3>
+                <h3 class="text-2xl font-bold text-gray-900 dark:text-white mt-2 break-all line-clamp-1">${safeTitle}</h3>
               </div>
-              <div class="flex items-center gap-2">
+              <div class="flex items-center gap-2 shrink-0">
                 ${note.pinned ? `<svg class=\"w-5 h-5 text-yellow-500\" fill=\"currentColor\" viewBox=\"0 0 20 20\" xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M10 15l-5 2 2-5 6-6 3 3-6 6z\"/></svg>` : ""}
-                <button onclick="event.stopPropagation(); openEditor(${noteDataString})" class="text-gray-500 hover:text-gray-900 dark:hover:text-gray-100 p-2 rounded-full transition-colors" title="Edit">
+                <button onclick="event.stopPropagation(); openEditor(${noteDataString})" class="text-gray-500 hover:text-gray-900 dark:hover:text-gray-100 p-2 rounded-full transition-colors" title="Edit" aria-label="Edit">
                   <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path>
                   </svg>
                 </button>
-                <button onclick="event.stopPropagation(); ${archiveAnimation}(this.closest('.note-card')); ${archiveHandler}" class="text-gray-500 hover:text-gray-900 dark:hover:text-gray-100 p-2 rounded-full transition-colors" title="${archiveAction}">
+                <button onclick="event.stopPropagation(); openPreview(${noteDataString})" class="text-gray-500 hover:text-gray-900 dark:hover:text-gray-100 p-2 rounded-full transition-colors" title="Preview" aria-label="Preview">
+                  <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5s8.268 2.943 9.542 7c-1.274 4.057-5.065 7-9.542 7s-8.268-2.943-9.542-7zm9.542 3a3 3 0 100-6 3 3 0 000 6z"></path>
+                  </svg>
+                </button>
+                <button onclick="event.stopPropagation(); ${archiveAnimation}(this.closest('.note-card')); ${archiveHandler}" class="text-gray-500 hover:text-gray-900 dark:hover:text-gray-100 p-2 rounded-full transition-colors" title="${archiveAction}" aria-label="${archiveAction}">
                   <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 8h14M5 12h14M5 16h14M5 20h14"></path>
                   </svg>
